@@ -1,4 +1,3 @@
-import os
 import sqlite3
 import asyncio
 import json
@@ -11,10 +10,31 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import logging
+from dotenv import load_dotenv
+import os
+import random
+import time
+from colorama import init, Fore, Style
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError, UserAlreadyParticipantError, UserPrivacyRestrictedError, UserNotParticipantError
+from telethon.tl.functions.channels import InviteToChannelRequest, GetParticipantRequest
+from telethon.tl.types import MessageService, ChannelParticipantsAdmins
+import sys
+
+init(autoreset=True)
+load_dotenv()
+
+# Carregar credenciais do .env
+API_ID = int(os.getenv('API_ID'))
+API_HASH = os.getenv('API_HASH')
+
+if not API_ID or not API_HASH:
+    raise ValueError("API_ID e API_HASH devem ser definidos no arquivo .env")
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(_name_)
 
 # Database setup
 DATABASE_PATH = "telegram_automation.db"
@@ -52,21 +72,6 @@ def init_database():
             finished_at TIMESTAMP,
             details TEXT,
             FOREIGN KEY (account_id) REFERENCES accounts (id)
-        )
-    ''')
-    
-    # Member scraping logs
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS member_logs (
-            id TEXT PRIMARY KEY,
-            log_id TEXT,
-            member_id TEXT,
-            username TEXT,
-            action TEXT,
-            success BOOLEAN,
-            error_message TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (log_id) REFERENCES automation_logs (id)
         )
     ''')
     
@@ -111,7 +116,7 @@ class AutomationRequest(BaseModel):
     target_group: str
     delay_min: int = 6
     delay_max: int = 15
-    max_members: int = 100
+    max_members: Optional[int] = None  # Agora opcional, sem limite fixo
 
 class Account(BaseModel):
     id: str
@@ -160,9 +165,6 @@ async def health_check():
 async def request_verification_code(account: AccountCreate):
     """Request verification code for Telegram account"""
     try:
-        # Here you would integrate with Telethon to request verification code
-        # For now, this is a placeholder that simulates the process
-        
         conn = get_db_connection()
         cursor = conn.cursor()
         
@@ -191,16 +193,17 @@ async def request_verification_code(account: AccountCreate):
         conn.commit()
         conn.close()
         
-        # TODO: Implement actual Telethon code request
-        # from telethon import TelegramClient
-        # client = TelegramClient(session_name, api_id, api_hash)
-        # await client.send_code_request(phone_number)
+        # Actual Telethon code request
+        client = TelegramClient(session_name, API_ID, API_HASH)
+        await client.connect()
+        await client.send_code_request(account.phone_number)
+        active_sessions[account.phone_number] = client  # Salvar client para verify
         
         logger.info(f"Código de verificação solicitado para {account.phone_number}")
         
         return {
             "success": True,
-            "message": "Código de verificação enviado",
+            "message": "Código de verificação enviado via Telegram",
             "account_id": account_id
         }
         
@@ -215,11 +218,13 @@ async def verify_code(verification: VerificationCode):
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # TODO: Implement actual Telethon verification
-        # client = TelegramClient(session_name, api_id, api_hash)
-        # await client.sign_in(phone_number, code)
+        # Get client from active_sessions
+        client = active_sessions.get(verification.phone_number)
+        if not client:
+            raise HTTPException(status_code=400, detail="Sessão não encontrada, solicite código novamente")
         
-        # For now, simulate successful verification
+        await client.sign_in(verification.phone_number, verification.code)
+        
         cursor.execute('''
             UPDATE accounts 
             SET status = 'authenticated', is_active = TRUE, last_used = CURRENT_TIMESTAMP
@@ -231,6 +236,8 @@ async def verify_code(verification: VerificationCode):
         
         conn.commit()
         conn.close()
+        
+        del active_sessions[verification.phone_number]  # Limpar após sign_in
         
         logger.info(f"Conta autenticada com sucesso: {verification.phone_number}")
         
@@ -269,15 +276,12 @@ async def get_accounts():
 
 @app.post("/api/accounts/{account_id}/activate")
 async def activate_account(account_id: str):
-    """Activate/deactivate account"""
+    """Activate account (sem desativar outras para permitir múltiplas)"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Deactivate all accounts first
-        cursor.execute("UPDATE accounts SET is_active = FALSE")
-        
-        # Activate selected account
+        # Ativa a conta selecionada (sem desativar outras)
         cursor.execute('''
             UPDATE accounts 
             SET is_active = TRUE, last_used = CURRENT_TIMESTAMP
@@ -344,7 +348,7 @@ async def start_automation(request: AutomationRequest, background_tasks: Backgro
             request.target_group,
             request.delay_min,
             request.delay_max,
-            request.max_members
+            request.max_members  # Passa None se não definido
         )
         
         automation_tasks[log_id] = {
@@ -464,67 +468,221 @@ async def get_automation_stats():
         raise HTTPException(status_code=500, detail=f"Erro ao buscar estatísticas: {str(e)}")
 
 async def run_automation_task(log_id: str, account_id: str, source_groups: List[str], 
-                            target_group: str, delay_min: int, delay_max: int, max_members: int):
-    """Background task for automation - PLACEHOLDER for your script"""
+                            target_group: str, delay_min: int, delay_max: int, max_members: Optional[int]):
+    """Background task for automation - Integrated script"""
     try:
         logger.info(f"Iniciando automação {log_id}")
         
-        # TODO: Replace this with your actual automation script
-        # This is a placeholder that simulates the automation process
-        
-        import random
-        import time
-        
+        # Buscar session_name do account_id
         conn = get_db_connection()
         cursor = conn.cursor()
+        cursor.execute("SELECT session_name FROM accounts WHERE id = ?", (account_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise Exception("Account not found")
+        session_name = row[0]
+        conn.close()
         
-        total_added = 0
-        total_errors = 0
+        # Criar client
+        client = TelegramClient(session_name, API_ID, API_HASH)
+        await client.start()
         
-        for i in range(min(max_members, 20)):  # Simulate adding up to 20 members
-            if log_id in automation_tasks and automation_tasks[log_id]["status"] == "stopped":
-                logger.info(f"Automação {log_id} foi parada pelo usuário")
-                break
+        # Configs adaptadas
+        DESTINO_URL = target_group
+        DELAY_MIN = delay_min
+        DELAY_MAX = delay_max
+        PAUSA_CADA = 10
+        PAUSA_MIN = 10
+        PAUSA_MAX = 20
+        ARQ_ALVO = "usuarios_alvo.txt"
+        CP_FILE = "checkpoint.txt"
+        LEDGER = "adicionados_global.csv"
+        LOG_CSV = "hydra_log.csv"
+        
+        # Funções auxiliares
+        def _append(path, line, header=None):
+            new = not os.path.exists(path)
+            with open(path, "a", encoding="utf-8") as f:
+                if header and new: f.write(header + "\n")
+                f.write(line + ("\n" if not line.endswith("\n") else ""))
+
+        def log(acao, alvo, detalhe=""):
+            ts = datetime.now().isoformat(timespec="seconds")
+            _append(LOG_CSV, f"{ts},{acao},{alvo},{detalhe}", header="timestamp,acao,alvo,detalhe")
+            logger.info(f"[LOG] {ts} - {acao}: {alvo} {detalhe}")
+
+        def load_set(path):
+            if not os.path.exists(path): return set()
+            with open(path, "r", encoding="utf-8") as f:
+                return set(x.strip() for x in f if x.strip())
+
+        def save_set(path, s):
+            with open(path, "w", encoding="utf-8") as f:
+                for x in sorted(s): f.write(x + "\n")
+
+        def ledger_add(username, destino):
+            ts = datetime.now().isoformat(timespec="seconds")
+            _append(LEDGER, f"{username},{destino},{ts}", header="username,destino,timestamp")
+
+        def ledger_seen(username):
+            if not os.path.exists(LEDGER): return False
+            with open(LEDGER, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("username,"): continue
+                    if line.split(",", 1)[0] == username: return True
+            return False
+
+        async def retry_func(client, func, max_retries=10):
+            for attempt in range(max_retries):
+                try:
+                    return await func()
+                except FloodWaitError as e:
+                    wait = min(e.seconds * (1.5 ** attempt), 3600) + random.randint(5, 15)
+                    log("floodwait", "retry", f"{wait}s")
+                    await asyncio.sleep(wait)
+                except Exception as e:
+                    log("retry_erro", "tentativa", str(e))
+                    if attempt == max_retries - 1: raise
+                    await asyncio.sleep(1.5 ** attempt + random.random() * 3)
+
+        def setup_event_handlers(client, destino_entity):
+            @client.on(events.ChatAction(chats=destino_entity.id))
+            async def _del_service(event):
+                try: await event.delete()
+                except: pass
+
+            @client.on(events.NewMessage(chats=destino_entity.id))
+            async def _del_incoming(event):
+                if isinstance(event.message, MessageService) or (event.message.from_id and event.message.text):
+                    try: await event.delete()
+                    except: pass
+
+        async def scrape_groups(links, simulate=False):
+            alvo = load_set(ARQ_ALVO)
+            total_new = 0
+            async def scrape_one(link):
+                nonlocal total_new
+                try:
+                    chat = await retry_func(client, lambda: client.get_entity(link))
+                    admin_ids = set(u.id async for u in client.iter_participants(chat, filter=ChannelParticipantsAdmins))
+                    async for u in client.iter_participants(chat):
+                        if u.bot or not u.username or u.deleted or u.id in admin_ids: continue
+                        uname = u.username.strip()
+                        if uname not in alvo:
+                            alvo.add(uname)
+                            total_new += 1
+                    log("scrape", link, f"{total_new} novos")
+                except Exception as e:
+                    log("scrape_erro", link, str(e))
+
+            tasks = [scrape_one(link) for link in links]
+            await asyncio.gather(*tasks)
+
+            if not simulate:
+                save_set(ARQ_ALVO, alvo)
+            log("scrape_ok", "total", str(len(alvo)))
+            return total_new
+
+        async def add_from_file(simulate=False):
+            destino_entity = await retry_func(client, lambda: client.get_entity(DESTINO_URL))
+            alvo = load_set(ARQ_ALVO)
+            cp = load_set(CP_FILE)
+            pend = [u for u in alvo if u not in cp]  # Sem limite fixo
+            if max_members is not None:
+                pend = pend[:max_members]  # Só se definido
+            if not pend: return 0, 0
+
+            total_ok = 0
+            total_errors = 0
+            batch_size = 1  # Sequencial
+
+            for batch_start in range(0, len(pend), batch_size):
+                if log_id in automation_tasks and automation_tasks[log_id]["status"] == "stopped":
+                    break
                 
-            # Simulate member addition with random success/failure
-            success = random.choice([True, True, True, False])  # 75% success rate
-            
-            if success:
-                total_added += 1
-                # Log successful addition
-                cursor.execute('''
-                    INSERT INTO member_logs (id, log_id, member_id, username, action, success)
-                    VALUES (?, ?, ?, ?, 'add_member', TRUE)
-                ''', (str(uuid.uuid4()), log_id, f"user_{i}", f"@username_{i}"))
-            else:
-                total_errors += 1
-                # Log error
-                cursor.execute('''
-                    INSERT INTO member_logs (id, log_id, member_id, action, success, error_message)
-                    VALUES (?, ?, ?, 'add_member', FALSE, 'Simulated error')
-                ''', (str(uuid.uuid4()), log_id, f"user_{i}"))
-            
-            # Update progress
-            cursor.execute('''
-                UPDATE automation_logs 
-                SET members_added = ?, errors = ?
-                WHERE id = ?
-            ''', (total_added, total_errors, log_id))
-            
-            conn.commit()
-            
-            # Simulate delay
-            delay = random.randint(delay_min, delay_max)
-            await asyncio.sleep(delay)
-        
+                batch = pend[batch_start:batch_start + batch_size]
+                results = await asyncio.gather(*[add_one(client, destino_entity, username, simulate, total_ok) for username in batch])
+                for result in results:
+                    if result == 1:
+                        total_ok += 1
+                    else:
+                        total_errors += 1
+
+                # Atualizar banco
+                conn_temp = get_db_connection()
+                cursor_temp = conn_temp.cursor()
+                cursor_temp.execute('''
+                    UPDATE automation_logs 
+                    SET members_added = ?, errors = ?
+                    WHERE id = ?
+                ''', (total_ok, total_errors, log_id))
+                conn_temp.commit()
+                conn_temp.close()
+
+                await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX) + random.random() * 2)
+                
+                if (batch_start // batch_size + 1) % PAUSA_CADA == 0:
+                    pausa = random.randint(PAUSA_MIN, PAUSA_MAX)
+                    logger.info(f"⏳ Pausa mínima {pausa}s...")
+                    await asyncio.sleep(pausa)
+
+            return total_ok, total_errors
+
+        async def add_one(client, destino_entity, username, simulate, total_ok):
+            if ledger_seen(username): 
+                _append(CP_FILE, username)
+                return 0
+
+            try:
+                user = await retry_func(client, lambda: client.get_entity(username))
+                try:
+                    await client(GetParticipantRequest(destino_entity, user))
+                    log("ja_no_grupo", username, "")
+                    _append(CP_FILE, username)
+                    return 0
+                except UserNotParticipantError:
+                    pass
+            except Exception as e:
+                log("resolver_fail", username, str(e))
+                return 0
+
+            if simulate:
+                logger.info(f"[SIM] Adicionado: @{username}")
+                _append(CP_FILE, username)
+                return 1
+
+            try:
+                await retry_func(client, lambda: client(InviteToChannelRequest(destino_entity, [user])))
+                ledger_add(username, DESTINO_URL)
+                log("adicionado", username, "")
+                logger.info(f"✅ Adicionado: @{username} | OK: {total_ok + 1}")
+                _append(CP_FILE, username)
+                return 1
+            except UserPrivacyRestrictedError:
+                log("privacidade", username, "")
+                _append(CP_FILE, username)
+                return 0
+            except Exception as e:
+                log("erro", username, str(e))
+                return 0
+
+        # Setup handlers
+        destino_entity = await client.get_entity(target_group)
+        setup_event_handlers(client, destino_entity)
+
+        # Rodar automação
+        await scrape_groups(source_groups, simulate=False)
+        total_added, total_errors = await add_from_file(simulate=False)
+
         # Mark as completed
+        conn = get_db_connection()
+        cursor = conn.cursor()
         cursor.execute('''
             UPDATE automation_logs 
             SET status = 'completed', finished_at = CURRENT_TIMESTAMP,
                 members_added = ?, errors = ?
             WHERE id = ?
         ''', (total_added, total_errors, log_id))
-        
         conn.commit()
         conn.close()
         
@@ -532,6 +690,8 @@ async def run_automation_task(log_id: str, account_id: str, source_groups: List[
             automation_tasks[log_id]["status"] = "completed"
         
         logger.info(f"Automação {log_id} concluída: {total_added} adicionados, {total_errors} erros")
+        
+        await client.disconnect()
         
     except Exception as e:
         logger.error(f"Erro na automação {log_id}: {str(e)}")
@@ -550,6 +710,6 @@ async def run_automation_task(log_id: str, account_id: str, source_groups: List[
         if log_id in automation_tasks:
             automation_tasks[log_id]["status"] = "failed"
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
